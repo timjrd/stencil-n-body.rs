@@ -61,8 +61,7 @@ mod app {
     let args: Vec<String> = std::env::args().collect();
     match parse_args(args.as_slice()) {
       None => eprintln!("usage: {} width height iterations-before \
-                           iterations out.mp4", args[0]),
-      
+                         iterations out.mp4", args[0]),
       Some(args) => {
         match Command::new("ffmpeg")
           .args(&["-video_size", &format!("{}x{}", args.width, args.height),
@@ -108,9 +107,11 @@ mod app {
     }
     for i in 0 .. args.it {
       print_it(args.it_before+i);
-      grid.iteration();
+      
       ffmpeg.write(grid.as_rgb()).ok()?;
       ffmpeg.flush().ok()?;
+      
+      grid.iteration();      
     }
     println!();
     Some(())
@@ -175,9 +176,9 @@ mod grid {
     const EPSILON: f32 = 0.0001;
     
     const THETA: f32 = 2.5;
-    const G:     f32 = 3.5;
+    const G:     f32 = 4.0;
     
-    const SPEED:      f32 = 0.4;
+    const SPEED:      f32 = 0.5;
     const RESISTANCE: f32 = 8.0;
     
     const PERIOD: usize = 1000;
@@ -185,12 +186,12 @@ mod grid {
     const HUE_RANGE:  f32 = 315.0;
     const FROM_HUE:   f32 = 0.0;
     const SATURATION: f32 = 0.6;
-    const BRIGHTNESS: f32 = 2.0;
+    const BRIGHTNESS: f32 = 2.5;
     
-    const DISCS:         usize = 222;
+    const DISCS:         usize = 444;
     const MIN_DISC_SIZE: f32   = 0.01;
     const MAX_DISC_SIZE: f32   = 0.1;
-    const INIT_MASS:     f32   = 5.0;
+    const INIT_MASS:     f32   = 1.0;
     
     pub fn new(width: usize, height: usize) -> Grid {
       let dim = Dim {width: width, height: height};
