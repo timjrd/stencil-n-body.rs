@@ -65,17 +65,17 @@ mod app {
       
       Some(args) => {
         match Command::new("ffmpeg")
-          .args(&["-f", "rawvideo",
-                  "-pixel_format", "rgb24",
-                  "-video_size", &format!("{}x{}", args.width, args.height),
-                  "-i", "-", "-y", args.out])
+          .args(&["-video_size", &format!("{}x{}", args.width, args.height),
+                  "-f", "rawvideo", "-pix_fmt", "rgb24", "-i", "-",
+                  "-codec", "libx264", "-preset", "slow", "-crf", "18",
+                  "-pix_fmt", "yuv420p", "-y", args.out])
           .stdin(Stdio::piped())
           .stdout(Stdio::null())
           .stderr(Stdio::null())
           .spawn() {
             Err(_)     => eprintln!("failed to start ffmpeg"),
             Ok(ffmpeg) => if run(args,ffmpeg).is_none() {
-              eprintln!("\rio error");
+              eprintln!("\rffmpeg error                    ");
             }
           }
       }
@@ -105,13 +105,11 @@ mod app {
     for i in 0 .. args.it_before {
       print_it(i);
       grid.iteration();
-      if i % 125 == 0 {grid.reverse_polarity()};
     }
     for i in 0 .. args.it {
       print_it(args.it_before+i);
       grid.iteration();
-      if i % 125 == 0 {grid.reverse_polarity()};      
-      grid.write_rgb(0.7, 135.0, ffmpeg).ok()?;
+      ffmpeg.write(grid.as_rgb()).ok()?;
       ffmpeg.flush().ok()?;
     }
     println!();
@@ -120,73 +118,125 @@ mod app {
 }
 
 mod grid {
+  use std::f32::consts::PI;
+
   use either::Either;
   use vec2::Vec2;
+  use hash;
   use quadtree::Tree;
 
-  #[derive(Copy,Clone)]
-  struct Cell {charge: f32, mass: f32}
-  #[derive(Copy,Clone)]
-  struct Dim {width: usize, height: usize}
+  struct Cell {
+    charge:   f32,
+    mass:     f32,
+    velocity: Vec2<f32>
+  }
   
-  struct Node {average: Cell, center: Vec2<f32>, leaf: bool}
+  #[derive(Copy,Clone)]
+  struct Dim { width: usize, height: usize }
+  
+  struct Node {
+    charge: f32,
+    mass:   f32,
+    center: Vec2<f32>,
+    leaf:   bool
+  }
   
   pub struct Grid {
-    matrix:     Vec<Cell>,
-    dim:        Dim,
+    matrix: Vec<Cell>,
+    dim:    Dim,
+    
     tree:       Tree<Node>,
     root_width: usize,
-    polarity:   bool
+    
+    time: usize,
+
+    image: Vec<u8>,
+    dirty: bool
   }
   
-  impl Cell {
-    const EMPTY: Cell = Cell {charge: 0.0, mass: 0.0};
-  }
-
   impl Dim {
     fn size(self) -> usize {
       self.width * self.height
     }
-    fn from(self, i: usize) -> (usize,usize) {
-      (i % self.width, i / self.width)
-    }
-    fn to(self, x: usize, y: usize) -> usize {
-      y * self.width + x
+    fn to(self, x: usize, y: usize) -> Option<usize> {
+      if x >= self.width || y >= self.height { None }
+      else { Some(y * self.width + x) }
     }
     fn ito(self, x: isize, y: isize) -> Option<usize> {
       if x < 0 || y < 0 { None }
-      else              { Some(self.to(x as usize, y as usize)) }
+      else { self.to(x as usize, y as usize) }
+    }
+    fn iter(self) -> impl Iterator<Item = (usize,usize)> {
+      (0..self.size()).map(move |i| (i % self.width, i / self.width))
     }
   }
 
   impl Grid {
-    const THETA: f32 = 3.0;
-    const G:     f32 = 3.0;
+    const EPSILON: f32 = 0.0001;
+    
+    const THETA: f32 = 2.5;
+    const G:     f32 = 3.5;
+    
+    const SPEED:      f32 = 0.4;
+    const RESISTANCE: f32 = 8.0;
+    
+    const PERIOD: usize = 1000;
+    
+    const HUE_RANGE:  f32 = 315.0;
+    const FROM_HUE:   f32 = 0.0;
+    const SATURATION: f32 = 0.6;
+    const BRIGHTNESS: f32 = 2.0;
+    
+    const DISCS:         usize = 222;
+    const MIN_DISC_SIZE: f32   = 0.01;
+    const MAX_DISC_SIZE: f32   = 0.1;
+    const INIT_MASS:     f32   = 5.0;
     
     pub fn new(width: usize, height: usize) -> Grid {
       let dim = Dim {width: width, height: height};
       let root_width = width.max(height).next_power_of_two();
+
+      let w  = width  as f32;
+      let h  = height as f32;
+      let lo = w.min(h) * Grid::MIN_DISC_SIZE / 2.0;
+      let hi = w.min(h) * Grid::MAX_DISC_SIZE / 2.0;
+      let discs: Vec<(Vec2<f32>,f32,f32)> = (0..Grid::DISCS).map(|i| {
+        let r = lo + hash::noise(hash::pair(i,0)) * (hi-lo);
+        let x = r + hash::noise(hash::pair(i,1)) * (w - 1.0 - 2.0*r);
+        let y = r + hash::noise(hash::pair(i,2)) * (h - 1.0 - 2.0*r);
+        (Vec2(x,y), r, hash::noise(hash::pair(i,3)))
+      }).collect();
       
-      let matrix: Vec<Cell> = (0..dim.size()).map(|i| {
-        let (x,y) = dim.from(i);
+      let matrix: Vec<Cell> = dim.iter().map(|(x,y)| {
+        let here = Vec2(x as f32, y as f32);
+        let (cs,ms) = discs.iter().fold((0.0,0.0), |(cs,ms),(p,r,c)| {
+          let m = 1.0 - ((here - *p).norm() / r).min(1.0);
+          (cs + m*c, ms + m)
+        });
         Cell {
-          charge: Grid::noise(Grid::pair(x/20, y/20)),
-          mass:   1.0
+          charge:   if ms > 0.0 {cs/ms} else {0.0},
+          mass:     ms * Grid::INIT_MASS,
+          velocity: Vec2::ZERO
         }
       }).collect();
       
       let tree = {
         let divide = |p| match p {
-          (1,x,y) => Either::Right( Node {
-            average: *matrix.get(dim.to(x,y)).unwrap_or(&Cell::EMPTY),
-            center:  Vec2(x as f32, y as f32),
-            leaf:    true
-          }),
+          (1,x,y) => {
+            let cell = dim.to(x,y).and_then(|i| matrix.get(i));
+            Either::Right( Node {
+              charge: cell.map_or(0.0, |x| x.charge),
+              mass:   cell.map_or(0.0, |x| x.mass),
+              center: Vec2(x as f32, y as f32),
+              leaf:   true
+            })
+          },
           (_,x,y) if x >= width || y >= height =>
             Either::Right( Node {
-              average: Cell::EMPTY,
-              center:  Vec2(x as f32, y as f32),
-              leaf:    true
+              charge: 0.0,
+              mass:   0.0,
+              center: Vec2(x as f32, y as f32),
+              leaf:   true
             }),
           (w,x,y) => Either::Left((
             (w/2, x      , y      ),
@@ -199,144 +249,150 @@ mod grid {
       };
       
       Grid {
-        matrix:     matrix,
-        dim:        dim,
+        matrix: matrix,
+        dim:    dim,
+        
         tree:       tree,
         root_width: root_width,
-        polarity:   true
-      }
-    }
-
-    pub fn write_rgb<W>(&self, saturation: f32, from_hue: f32, writer: &mut W)
-                        -> std::io::Result<()>
-      where W: std::io::Write {
-      for x in self.matrix.iter() {
-        let hue   = (from_hue + x.charge*180.0) % 360.0;
-        let value = 1.0 - (1.0 / (x.mass * 4.0 + 1.0));
         
-        let f = |n| {
-          let k: f32 = (n + hue/60.0) % 6.0;
-          value - value * saturation
-            * 0_f32.max( 1_f32.min( k.min( 4.0-k )))
-        };
-        let r = f(5.0) * 255.0;
-        let g = f(3.0) * 255.0;
-        let b = f(1.0) * 255.0;
+        time: 0,
 
-        writer.write(&[r as u8, g as u8, b as u8])?;
+        image: vec![0; dim.size()*3],
+        dirty: true
       }
-      Ok(())
     }
 
-    pub fn reverse_polarity(&mut self) {
-      self.polarity = ! self.polarity;
+    pub fn as_rgb(&mut self) -> &[u8] {
+      let image = self.image.as_mut_slice();
+      if self.dirty {
+        for (pixel,cell) in image.chunks_mut(3).zip(self.matrix.iter()) {
+          let (r,g,b) = Grid::to_rgb(cell);
+          pixel[0] = r;
+          pixel[1] = g;
+          pixel[2] = b;
+        }
+      }
+      image
     }
     
     pub fn iteration(&mut self) {
-      for i in 0 .. self.dim.size() {
-        let (x,y) = self.dim.from(i);
+      for (x,y) in self.dim.iter() {
         self.kernel(x,y);
       }
       self.update_tree();
+      self.time  = (self.time + 1) % Grid::PERIOD;
+      self.dirty = true;
     }
     
     fn kernel(&mut self, x: usize, y: usize) {
       let dim  = self.dim;
-      if x < dim.width && y < dim.height {
-        let polarity = self.polarity;
-        let here = Vec2(x as f32, y as f32);      
-
-        let (before,after) = self.matrix.as_mut_slice().split_at_mut(dim.to(x,y));
+      dim.to(x,y).map(|i| {
+        
+        let (before,after) = self.matrix.as_mut_slice().split_at_mut(i);
         let (this,after) = after.split_at_mut(1);
         let this = &mut this[0];
-
-        let net_force = {
-          let fold = |acc, node: &Node| {
-            let charge_mass = Grid::charge_mass(node.average.charge, this.charge)
-              * if polarity {1.0} else {-1.0};
-            acc + Grid::force( Grid::G, node.center, here,
-                               charge_mass.abs() * node.average.mass,
-                               charge_mass.abs() * this.mass ) * charge_mass.signum()
-          };
-          let leaf = |width, node: &Node| node.leaf
-            || width as f32 / (here - node.center).norm() < Grid::THETA;
+        if this.mass > Grid::EPSILON {
           
-          self.tree.fold(self.root_width, Vec2::ZERO, &fold, &leaf)
-        };
+          let polarity = self.time as f32 / Grid::PERIOD as f32;
+          let polarity = - (polarity * 2.0 - 1.0).signum();
+          let here = Vec2(x as f32, y as f32);
+          
+          let net_force = {
+            let fold = |acc, node: &Node| {
+              let charge_mass = polarity
+                * Grid::charge_mass(node.charge, this.charge);
+              let force = Grid::force( Grid::G, node.center, here,
+                                       charge_mass.abs() * node.mass,
+                                       charge_mass.abs() * this.mass );
+              acc + force*charge_mass.signum()
+            };
+            let leaf = |width, node: &Node| node.leaf
+              || width as f32 / (here - node.center).norm() < Grid::THETA;
+            
+            self.tree.fold(self.root_width, Vec2::ZERO, &fold, &leaf)
+          };
 
-        let mut drain = |dx: isize, dy: isize| {
-          let dir     = Vec2(dx as f32, dy as f32).unit();
-          let angle   = net_force.unit().dot(dir).acos();
-          let quarter = std::f32::consts::PI / 4.0;
-          if angle < quarter {
-            dim.ito(x as isize + dx, y as isize + dy).map(|i| {
-              let mut other = if i < dim.to(x,y) {
-                before.get_mut(i)
-              }
-              else {
-                after.get_mut(i - dim.to(x,y))
-              };
-              other.as_mut().map(|other| {
-                let drained = ((quarter - angle) / quarter) * net_force.norm();
-                let drained = drained.min(this.mass / 4.0);
-                if  drained > 0.0 {
+          this.velocity = this.velocity + net_force;
+          
+          let mut drain = |dx: isize, dy: isize| {
+            let dir     = Vec2(dx as f32, dy as f32).unit();
+            let angle   = this.velocity.unit().dot(dir).acos();
+            let quarter = PI / 4.0;
+            if angle < quarter {
+              dim.ito(x as isize + dx, y as isize + dy).map(|oi| {
+                let mut other = if oi < i {
+                  before.get_mut(oi)
+                }
+                else {
+                  after.get_mut(oi-i-1)
+                };
+                other.as_mut().map(|other| {
+                  let drained = (1.0 - angle/quarter) * this.velocity.norm();
+                  let drained = drained.min(this.mass * Grid::SPEED);
+                  let drained = drained.min(1.0 / (other.mass * Grid::RESISTANCE));
+
+                  other.velocity = (other.velocity*other.mass + this.velocity*drained)
+                    / (other.mass + drained);
+                    
                   other.charge = (other.charge*other.mass + this.charge*drained)
                     / (other.mass + drained);
-                
+                    
                   this.mass  -= drained;
                   other.mass += drained;
-                }
+                });
               });
-            });
-          }
-        };
-        
-        drain(-1, -1);
-        drain(-1,  0);
-        drain(-1,  1);
-        drain( 0, -1);
-        //     0,  0  
-        drain( 0,  1);
-        drain( 1, -1);
-        drain( 1,  0);
-        drain( 1,  1);
-      }
+            }
+          };
+          
+          drain(-1, -1);
+          drain(-1,  0);
+          drain(-1,  1);
+          drain( 0, -1);
+          //     0,  0  
+          drain( 0,  1);
+          drain( 1, -1);
+          drain( 1,  0);
+          drain( 1,  1);
+        }
+      });
     }
     
     fn update_tree(&mut self) {
       let matrix = &self.matrix;
       let dim    = self.dim;
-      let leaf = |x: &Node| Node {
-        average: *matrix.get(dim.to(x.center.0 as usize, x.center.1 as usize))
-          .unwrap_or(&Cell::EMPTY), .. *x
+      let leaf = |x: &Node| {
+        let cell = dim.to(x.center.0 as usize, x.center.1 as usize)
+          .and_then(|i| matrix.get(i));
+        Node {
+          charge: cell.map_or(0.0, |c| c.charge),
+          mass:   cell.map_or(0.0, |c| c.mass),
+          .. *x
+        }
       };
       self.tree.aggregate(&Grid::aggregate, &leaf);
     }
     
     fn aggregate(a: &Node, b: &Node, c: &Node, d: &Node) -> Node {
-      let mass =
-        a.average.mass +
-        b.average.mass +
-        c.average.mass +
-        d.average.mass;
-      let (charge,center) = if mass == 0.0 {
+      let mass = a.mass + b.mass + c.mass + d.mass;
+      let (charge,center) = if mass < Grid::EPSILON {
         (0.0, (a.center+b.center+c.center+d.center) / 4.0)
       }
       else {(
-        ( a.average.charge * a.average.mass +
-          b.average.charge * b.average.mass +
-          c.average.charge * c.average.mass +
-          d.average.charge * d.average.mass ) / mass,
-        ( a.center * a.average.mass +
-          b.center * b.average.mass +
-          c.center * c.average.mass +
-          d.center * d.average.mass ) / mass
+        ( a.charge * a.mass +
+          b.charge * b.mass +
+          c.charge * c.mass +
+          d.charge * d.mass ) / mass,
+        ( a.center * a.mass +
+          b.center * b.mass +
+          c.center * c.mass +
+          d.center * d.mass ) / mass
       )};
 
       Node {
-        average: Cell {charge: charge, mass: mass},
-        center:  center,
-        leaf:    mass == 0.0
+        charge: charge,
+        mass:   mass,
+        center: center,
+        leaf:   mass < Grid::EPSILON
       }
     }
     
@@ -345,35 +401,29 @@ mod grid {
       let r = r2 - r1;
       let d = r.norm();
       if  d == 0.0 { Vec2::ZERO } else {
-        r.unit() * (-g) * ((m1 * m2) / (d * d))
+        r.unit() * (-g) * ((m2 * m1) / (d * d))
       }
     }
     
     // charge_mass > 0 means attraction, repulsion otherwise
     fn charge_mass(c1: f32, c2: f32) -> f32 {
-      let x = c2 - c1 - 1.0;
-      let x = x*x*x*x * 2.0 - 1.0;
-      x*x * 2.0 - 1.0
+      (c2 - c1).abs() * 2.0 - 1.0
     }
 
-    // taken from:
-    // https://web.archive.org/web/20120903003157/http://www.cris.com:80/~Ttwang/tech/inthash.htm
-    fn hash(key: i64) -> i64 {
-      let key = (!key) + (key << 21);
-      let key = key ^ (key >> 24);
-      let key = (key + (key << 3)) + (key << 8);
-      let key = key ^ (key >> 14);
-      let key = (key + (key << 2)) + (key << 4);
-      let key = key ^ (key >> 28);
-      let key = key + (key << 31);
-      key
-    }
-    fn noise(x: usize) -> f32 {
-      let m = 1 << 16;
-      (Grid::hash(x as i64).abs() % m) as f32 / (m-1) as f32
-    }
-    fn pair(k1: usize, k2: usize) -> usize {
-      ((k1 + k2) * (k1 + k2 + 1)) / 2 + k2
+    fn to_rgb(cell: &Cell) -> (u8,u8,u8) {
+      let hue   = (cell.charge * Grid::HUE_RANGE + Grid::FROM_HUE) % 360.0;
+      let value = 1.0 - (1.0 / (cell.mass * Grid::BRIGHTNESS + 1.0));
+      
+      let f = |n| {
+        let k: f32 = (n + hue/60.0) % 6.0;
+        value - value * Grid::SATURATION
+          * 0_f32.max( 1_f32.min( k.min( 4.0-k )))
+      };
+      let r = f(5.0) * 255.0;
+      let g = f(3.0) * 255.0;
+      let b = f(1.0) * 255.0;
+      
+      (r as u8, g as u8, b as u8)
     }
   }
 }
@@ -442,6 +492,30 @@ mod quadtree {
         })
       };
     }
+  }
+}
+
+mod hash {
+  pub fn pair(k1: usize, k2: usize) -> usize {
+    ((k1 + k2) * (k1 + k2 + 1)) / 2 + k2
+  }
+  
+  // taken from:
+  // https://web.archive.org/web/20120903003157/http://www.cris.com:80/~Ttwang/tech/inthash.htm    
+  pub fn hash(key: i64) -> i64 {
+    let key = (!key) + (key << 21);
+    let key = key ^ (key >> 24);
+    let key = (key + (key << 3)) + (key << 8);
+    let key = key ^ (key >> 14);
+    let key = (key + (key << 2)) + (key << 4);
+    let key = key ^ (key >> 28);
+    let key = key + (key << 31);
+    key
+  }
+  
+  pub fn noise(x: usize) -> f32 {
+    let m = 1 << 16;
+    (hash(x as i64).abs() % m) as f32 / (m-1) as f32
   }
 }
 
