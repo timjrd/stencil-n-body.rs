@@ -271,6 +271,7 @@ mod grid {
           pixel[1] = g;
           pixel[2] = b;
         }
+        self.dirty = false;
       }
       image
     }
