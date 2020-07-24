@@ -4,36 +4,36 @@
 // Licensed under the Apache License, Version 2.0 (the "License"); you
 // may not use this file except in compliance with the License. You
 // may obtain a copy of the License at
-// 
+//
 //   http://www.apache.org/licenses/LICENSE-2.0
-// 
+//
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-// 
+//
 // DESCRIPTION
-//   
+//
 //   This program performs a Barnes–Hut N-body simulation on a grid
 //   together with a stencil code to produce an artistic video.
-//   
+//
 // SETUP
-//   
+//
 //   You need "rustc" (tested with version 1.34.0) to compile this
 //   file, and "ffmpeg" (tested with version 4.1.1) must be in your
 //   PATH.
-//   
+//
 //   https://www.rust-lang.org/tools/install
 //   https://ffmpeg.org/download.html
-//   
+//
 // BUILD & RUN
-//   
+//
 //   $ rustc -O stencil-n-body.rs
 //   $ ./stencil-n-body 720 480 10 125 out.mp4
 //                      ^   ^   ^  ^   ^
 //                      1   2   3  4   5
-//   
+//
 //   This will produce a raw RGB video and stream it to ffmpeg for
 //   encoding; where (1) is the video width, (2) its height, (3) the
 //   number of iterations to run before the video, (4) the number of
@@ -57,7 +57,7 @@ mod app {
     out:       &'a String
   }
 
-  pub fn app() {    
+  pub fn app() {
     let args: Vec<String> = std::env::args().collect();
     match parse_args(args.as_slice()) {
       None => eprintln!("usage: {} width height iterations-before \
@@ -80,7 +80,7 @@ mod app {
       }
     }
   }
-  
+
   fn parse_args(args: &[String]) -> Option<Args> {
     match args {
       [_,a,b,c,d,e] => Some(Args {
@@ -92,7 +92,7 @@ mod app {
       _ => None
     }
   }
-  
+
   fn run(args: Args, mut ffmpeg: Child) -> Option<()> {
     let print_it = |i| {
       print!("\r {: <5} / {: <5} ", i+1, args.it_before + args.it);
@@ -100,18 +100,18 @@ mod app {
     };
     let ffmpeg = ffmpeg.stdin.as_mut()?;
     let mut grid = Grid::new(args.width, args.height);
-    
+
     for i in 0 .. args.it_before {
       print_it(i);
       grid.iteration();
     }
     for i in 0 .. args.it {
       print_it(args.it_before+i);
-      
+
       ffmpeg.write(grid.as_rgb()).ok()?;
       ffmpeg.flush().ok()?;
-      
-      grid.iteration();      
+
+      grid.iteration();
     }
     println!();
     Some(())
@@ -131,30 +131,30 @@ mod grid {
     mass:     f32,
     velocity: Vec2<f32>
   }
-  
+
   #[derive(Copy,Clone)]
   struct Dim { width: usize, height: usize }
-  
+
   struct Node {
     charge: f32,
     mass:   f32,
     center: Vec2<f32>,
     leaf:   bool
   }
-  
+
   pub struct Grid {
     matrix: Vec<Cell>,
     dim:    Dim,
-    
+
     tree:       Tree<Node>,
     root_width: usize,
-    
+
     time: usize,
 
     image: Vec<u8>,
     dirty: bool
   }
-  
+
   impl Dim {
     fn size(self) -> usize {
       self.width * self.height
@@ -174,25 +174,25 @@ mod grid {
 
   impl Grid {
     const EPSILON: f32 = 0.0001;
-    
+
     const THETA: f32 = 2.5;
-    const G:     f32 = 4.0;
-    
+    const G:     f32 = 3.5;
+
     const SPEED:      f32 = 0.5;
-    const RESISTANCE: f32 = 8.0;
-    
+    const RESISTANCE: f32 = 7.0;
+
     const PERIOD: usize = 1000;
-    
+
     const HUE_RANGE:  f32 = 315.0;
     const FROM_HUE:   f32 = 0.0;
     const SATURATION: f32 = 0.6;
     const BRIGHTNESS: f32 = 2.5;
-    
+
     const DISCS:         usize = 444;
     const MIN_DISC_SIZE: f32   = 0.01;
-    const MAX_DISC_SIZE: f32   = 0.1;
+    const MAX_DISC_SIZE: f32   = 0.15;
     const INIT_MASS:     f32   = 1.0;
-    
+
     pub fn new(width: usize, height: usize) -> Grid {
       let dim = Dim {width: width, height: height};
       let root_width = width.max(height).next_power_of_two();
@@ -207,7 +207,7 @@ mod grid {
         let y = r + hash::noise(hash::pair(i,2)) * (h - 1.0 - 2.0*r);
         (Vec2(x,y), r, hash::noise(hash::pair(i,3)))
       }).collect();
-      
+
       let matrix: Vec<Cell> = dim.iter().map(|(x,y)| {
         let here = Vec2(x as f32, y as f32);
         let (cs,ms) = discs.iter().fold((0.0,0.0), |(cs,ms),(p,r,c)| {
@@ -220,7 +220,7 @@ mod grid {
           velocity: Vec2::ZERO
         }
       }).collect();
-      
+
       let tree = {
         let divide = |p| match p {
           (1,x,y) => {
@@ -248,14 +248,14 @@ mod grid {
         };
         Tree::unfold((root_width,0,0), &divide, &Grid::aggregate)
       };
-      
+
       Grid {
         matrix: matrix,
         dim:    dim,
-        
+
         tree:       tree,
         root_width: root_width,
-        
+
         time: 0,
 
         image: vec![0; dim.size()*3],
@@ -276,29 +276,34 @@ mod grid {
       }
       image
     }
-    
+
     pub fn iteration(&mut self) {
       for (x,y) in self.dim.iter() {
         self.kernel(x,y);
       }
+
       self.update_tree();
+
       self.time  = (self.time + 1) % Grid::PERIOD;
       self.dirty = true;
     }
-    
+
     fn kernel(&mut self, x: usize, y: usize) {
       let dim  = self.dim;
       dim.to(x,y).map(|i| {
-        
+
         let (before,after) = self.matrix.as_mut_slice().split_at_mut(i);
         let (this,after) = after.split_at_mut(1);
         let this = &mut this[0];
-        if this.mass > Grid::EPSILON {
-          
+
+        if this.mass < Grid::EPSILON {
+          this.mass = 0.0;
+        }
+        else {
           let polarity = self.time as f32 / Grid::PERIOD as f32;
           let polarity = - (polarity * 2.0 - 1.0).signum();
           let here = Vec2(x as f32, y as f32);
-          
+
           let net_force = {
             let fold = |acc, node: &Node| {
               let charge_mass = polarity
@@ -310,12 +315,12 @@ mod grid {
             };
             let leaf = |width, node: &Node| node.leaf
               || width as f32 / (here - node.center).norm() < Grid::THETA;
-            
+
             self.tree.fold(self.root_width, Vec2::ZERO, &fold, &leaf)
           };
 
           this.velocity = this.velocity + net_force;
-          
+
           let mut drain = |dx: isize, dy: isize| {
             let dir     = Vec2(dx as f32, dy as f32).unit();
             let angle   = this.velocity.unit().dot(dir).acos();
@@ -335,22 +340,22 @@ mod grid {
 
                   other.velocity = (other.velocity*other.mass + this.velocity*drained)
                     / (other.mass + drained);
-                    
+
                   other.charge = (other.charge*other.mass + this.charge*drained)
                     / (other.mass + drained);
-                    
+
                   this.mass  -= drained;
                   other.mass += drained;
                 });
               });
             }
           };
-          
+
           drain(-1, -1);
           drain(-1,  0);
           drain(-1,  1);
           drain( 0, -1);
-          //     0,  0  
+          //     0,  0
           drain( 0,  1);
           drain( 1, -1);
           drain( 1,  0);
@@ -358,7 +363,7 @@ mod grid {
         }
       });
     }
-    
+
     fn update_tree(&mut self) {
       let matrix = &self.matrix;
       let dim    = self.dim;
@@ -373,10 +378,10 @@ mod grid {
       };
       self.tree.aggregate(&Grid::aggregate, &leaf);
     }
-    
+
     fn aggregate(a: &Node, b: &Node, c: &Node, d: &Node) -> Node {
       let mass = a.mass + b.mass + c.mass + d.mass;
-      let (charge,center) = if mass < Grid::EPSILON {
+      let (charge,center) = if mass == 0.0 {
         (0.0, (a.center+b.center+c.center+d.center) / 4.0)
       }
       else {(
@@ -397,7 +402,7 @@ mod grid {
         leaf:   mass < Grid::EPSILON
       }
     }
-    
+
     // force applied on object 2 exerted by object 1
     fn force(g: f32, r1: Vec2<f32>, r2: Vec2<f32>, m1: f32, m2: f32) -> Vec2<f32> {
       let r = r2 - r1;
@@ -406,7 +411,7 @@ mod grid {
         r.unit() * (-g) * ((m2 * m1) / (d * d))
       }
     }
-    
+
     // charge_mass > 0 means attraction, repulsion otherwise
     fn charge_mass(c1: f32, c2: f32) -> f32 {
       (c2 - c1).abs() * 2.0 - 1.0
@@ -415,7 +420,7 @@ mod grid {
     fn to_rgb(cell: &Cell) -> (u8,u8,u8) {
       let hue   = (cell.charge * Grid::HUE_RANGE + Grid::FROM_HUE) % 360.0;
       let value = 1.0 - (1.0 / (cell.mass * Grid::BRIGHTNESS + 1.0));
-      
+
       let f = |n| {
         let k: f32 = (n + hue/60.0) % 6.0;
         value - value * Grid::SATURATION
@@ -424,7 +429,7 @@ mod grid {
       let r = f(5.0) * 255.0;
       let g = f(3.0) * 255.0;
       let b = f(1.0) * 255.0;
-      
+
       (r as u8, g as u8, b as u8)
     }
   }
@@ -432,14 +437,14 @@ mod grid {
 
 mod quadtree {
   use either::Either;
-  
+
   type Children<T> = (T,T,T,T);
-  
+
   pub struct Tree<T> {
     value:    T,
     children: Option<Box<Children<Tree<T>>>>
   }
-  
+
   impl<T> Tree<T> {
     pub fn unfold<P,D,C>(parent: P, divide: &D, aggregate: &C) -> Tree<T>
       where D: Fn(P) -> Either<Children<P>,T>,
@@ -478,7 +483,7 @@ mod quadtree {
         }
       }}
     }
-    
+
     pub fn aggregate<I,L>(&mut self, inner: &I, leaf: &L)
       where I: Fn(&T,&T,&T,&T) -> T,
             L: Fn(&T) -> T {
@@ -501,10 +506,19 @@ mod hash {
   pub fn pair(k1: usize, k2: usize) -> usize {
     ((k1 + k2) * (k1 + k2 + 1)) / 2 + k2
   }
-  
+
+  pub fn noise(x: usize) -> f32 {
+    let m = 1 << 16;
+    (hash(x) % m) as f32 / (m-1) as f32
+  }
+
+  pub fn hash(x: usize) -> usize {
+    hash64shift(x as i64) as usize
+  }
+
   // taken from:
-  // https://web.archive.org/web/20120903003157/http://www.cris.com:80/~Ttwang/tech/inthash.htm    
-  pub fn hash(key: i64) -> i64 {
+  // https://web.archive.org/web/20120903003157/http://www.cris.com:80/~Ttwang/tech/inthash.htm
+  fn hash64shift(key: i64) -> i64 {
     let key = (!key) + (key << 21);
     let key = key ^ (key >> 24);
     let key = (key + (key << 3)) + (key << 8);
@@ -514,11 +528,6 @@ mod hash {
     let key = key + (key << 31);
     key
   }
-  
-  pub fn noise(x: usize) -> f32 {
-    let m = 1 << 16;
-    (hash(x as i64).abs() % m) as f32 / (m-1) as f32
-  }
 }
 
 mod vec2 {
@@ -526,13 +535,13 @@ mod vec2 {
   use std::ops::Sub;
   use std::ops::Mul;
   use std::ops::Div;
-  
+
   #[derive(Copy,Clone,Debug)]
   pub struct Vec2<T>(pub T, pub T);
 
   impl Vec2<f32> {
     pub const ZERO: Vec2<f32> = Vec2(0.0,0.0);
-    
+
     pub fn norm(self) -> f32 {
       (self.0*self.0 + self.1*self.1).sqrt()
     }
@@ -543,7 +552,7 @@ mod vec2 {
       self.0 * other.0 + self.1 * other.1
     }
   }
-  
+
   impl<T> Add for Vec2<T>
     where T: Add<Output = T> {
     type Output = Vec2<T>;
@@ -558,7 +567,7 @@ mod vec2 {
       Vec2(self.0 + other, self.1 + other)
     }
   }
-  
+
   impl<T> Sub for Vec2<T>
     where T: Sub<Output = T> {
     type Output = Vec2<T>;
@@ -573,7 +582,7 @@ mod vec2 {
       Vec2(self.0 - other, self.1 - other)
     }
   }
-  
+
   impl<T> Mul for Vec2<T>
     where T: Mul<Output = T> {
     type Output = Vec2<T>;
@@ -588,7 +597,7 @@ mod vec2 {
       Vec2(self.0 * other, self.1 * other)
     }
   }
-  
+
   impl<T> Div for Vec2<T>
     where T: Div<Output = T> {
     type Output = Vec2<T>;
