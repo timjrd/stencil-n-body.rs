@@ -1,5 +1,5 @@
 // stencil-n-body.rs
-// Copyright 2019 Timothée Jourde
+// Copyright 2020 Timothée Jourde
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you
 // may not use this file except in compliance with the License. You
@@ -125,14 +125,16 @@ mod grid {
   use vec2::Vec2;
   use hash;
   use quadtree::Tree;
+  use dbuffer::DBuffer;
 
+  #[derive(Clone,Copy)]
   struct Cell {
     charge:   f32,
     mass:     f32,
     velocity: Vec2<f32>
   }
 
-  #[derive(Copy,Clone)]
+  #[derive(Clone,Copy)]
   struct Dim { width: usize, height: usize }
 
   struct Node {
@@ -143,7 +145,7 @@ mod grid {
   }
 
   pub struct Grid {
-    matrix: Vec<Cell>,
+    matrix: DBuffer<Vec<Cell>>,
     dim:    Dim,
 
     tree:       Tree<Node>,
@@ -153,6 +155,14 @@ mod grid {
 
     image: Vec<u8>,
     dirty: bool
+  }
+
+  impl Cell {
+    const ZERO: Cell = Cell {
+      charge:   0.0,
+      mass:     0.0,
+      velocity: Vec2::ZERO,
+    };
   }
 
   impl Dim {
@@ -208,7 +218,7 @@ mod grid {
         (Vec2(x,y), r, hash::noise(hash::pair(i,3)))
       }).collect();
 
-      let matrix: Vec<Cell> = dim.iter().map(|(x,y)| {
+      let matrix_a: Vec<Cell> = dim.iter().map(|(x,y)| {
         let here = Vec2(x as f32, y as f32);
         let (cs,ms) = discs.iter().fold((0.0,0.0), |(cs,ms),(p,r,c)| {
           let m = 1.0 - ((here - *p).norm() / r).min(1.0);
@@ -217,14 +227,14 @@ mod grid {
         Cell {
           charge:   if ms > 0.0 {cs/ms} else {0.0},
           mass:     ms * Grid::INIT_MASS,
-          velocity: Vec2::ZERO
+          velocity: Vec2::ZERO,
         }
       }).collect();
 
       let tree = {
         let divide = |p| match p {
           (1,x,y) => {
-            let cell = dim.to(x,y).and_then(|i| matrix.get(i));
+            let cell = dim.to(x,y).and_then(|i| matrix_a.get(i));
             Either::Right( Node {
               charge: cell.map_or(0.0, |x| x.charge),
               mass:   cell.map_or(0.0, |x| x.mass),
@@ -250,11 +260,11 @@ mod grid {
       };
 
       Grid {
-        matrix: matrix,
-        dim:    dim,
+        matrix: DBuffer::new(matrix_a, vec![Cell::ZERO; dim.size()]),
+        dim,
 
-        tree:       tree,
-        root_width: root_width,
+        tree,
+        root_width,
 
         time: 0,
 
@@ -266,7 +276,7 @@ mod grid {
     pub fn as_rgb(&mut self) -> &[u8] {
       let image = self.image.as_mut_slice();
       if self.dirty {
-        for (pixel,cell) in image.chunks_mut(3).zip(self.matrix.iter()) {
+        for (pixel,cell) in image.chunks_mut(3).zip(self.matrix.source().iter()) {
           let (r,g,b) = Grid::to_rgb(cell);
           pixel[0] = r;
           pixel[1] = g;
@@ -282,6 +292,19 @@ mod grid {
         self.kernel(x,y);
       }
 
+      for cell in self.matrix.target() {
+        if cell.mass > 0.0 {
+          cell.velocity = cell.velocity / cell.mass;
+          cell.charge   = cell.charge   / cell.mass;
+        }
+      }
+
+      self.matrix.swap();
+
+      for cell in self.matrix.target() {
+        *cell = Cell::ZERO;
+      }
+
       self.update_tree();
 
       self.time  = (self.time + 1) % Grid::PERIOD;
@@ -289,18 +312,17 @@ mod grid {
     }
 
     fn kernel(&mut self, x: usize, y: usize) {
-      let dim  = self.dim;
+      let (source,target) = self.matrix.source_target();
+      let time = self.time;
+      let tree = &self.tree;
+      let root_width = self.root_width;
+      let dim = self.dim;
+
       dim.to(x,y).map(|i| {
+        let this = &source[i];
 
-        let (before,after) = self.matrix.as_mut_slice().split_at_mut(i);
-        let (this,after) = after.split_at_mut(1);
-        let this = &mut this[0];
-
-        if this.mass < Grid::EPSILON {
-          this.mass = 0.0;
-        }
-        else {
-          let polarity = self.time as f32 / Grid::PERIOD as f32;
+        if this.mass > Grid::EPSILON {
+          let polarity = time as f32 / Grid::PERIOD as f32;
           let polarity = - (polarity * 2.0 - 1.0).signum();
           let here = Vec2(x as f32, y as f32);
 
@@ -316,56 +338,74 @@ mod grid {
             let leaf = |width, node: &Node| node.leaf
               || width as f32 / (here - node.center).norm() < Grid::THETA;
 
-            self.tree.fold(self.root_width, Vec2::ZERO, &fold, &leaf)
+            tree.fold(root_width, Vec2::ZERO, &fold, &leaf)
           };
 
-          this.velocity = this.velocity + net_force;
+          let this_velocity = this.velocity + net_force;
 
-          let mut drain = |dx: isize, dy: isize| {
+          let drained_mass = |&(dx, dy)| {
             let dir     = Vec2(dx as f32, dy as f32).unit();
-            let angle   = this.velocity.unit().dot(dir).acos();
+            let angle   = this_velocity.unit().dot(dir).acos();
             let quarter = PI / 4.0;
-            if angle < quarter {
+            if angle >= quarter {
+              None
+            }
+            else {
               dim.ito(x as isize + dx, y as isize + dy).map(|oi| {
-                let mut other = if oi < i {
-                  before.get_mut(oi)
-                }
-                else {
-                  after.get_mut(oi-i-1)
-                };
-                other.as_mut().map(|other| {
-                  let drained = (1.0 - angle/quarter) * this.velocity.norm();
-                  let drained = drained.min(this.mass * Grid::SPEED);
-                  let drained = drained.min(1.0 / (other.mass * Grid::RESISTANCE));
+                let other = &source[oi];
 
-                  other.velocity = (other.velocity*other.mass + this.velocity*drained)
-                    / (other.mass + drained);
+                let drained = (1.0 - angle/quarter) * this_velocity.norm();
+                let drained = drained.min(this.mass * Grid::SPEED);
+                let drained = drained.min(1.0 / (other.mass * Grid::RESISTANCE));
 
-                  other.charge = (other.charge*other.mass + this.charge*drained)
-                    / (other.mass + drained);
-
-                  this.mass  -= drained;
-                  other.mass += drained;
-                });
-              });
+                Some((drained, (other, oi)))
+              }).flatten()
             }
           };
 
-          drain(-1, -1);
-          drain(-1,  0);
-          drain(-1,  1);
-          drain( 0, -1);
-          //     0,  0
-          drain( 0,  1);
-          drain( 1, -1);
-          drain( 1,  0);
-          drain( 1,  1);
+          let adjacent = [
+            (-1,  1), ( 0,  1), ( 1,  1),
+            (-1,  0), /*0,  0*/ ( 1,  0),
+            (-1, -1), ( 0, -1), ( 1, -1),
+          ];
+
+          { /* writing to target */
+
+               let (before,after) = target.as_mut_slice().split_at_mut(i);
+               let (this_target,after) = after.split_at_mut(1);
+               let this_target = &mut this_target[0];
+
+               let mut drain = |(drained, (_other, oi)): (f32, (&Cell, usize))| {
+                 let mut other_target = if oi < i {
+                   before.get_mut(oi)
+                 }
+                 else {
+                   after.get_mut(oi-i-1)
+                 };
+                 other_target.as_mut().map(|other_target| {
+                   other_target.velocity += this_velocity * drained;
+                   other_target.charge   += this.charge * drained;
+                   other_target.mass     += drained;
+                 });
+               };
+
+               let mut remaining_mass = this.mass;
+               for (x,a) in adjacent.iter().filter_map(drained_mass) {
+                 let dx = x.min(remaining_mass);
+                 remaining_mass -= dx;
+                 drain((dx,a));
+               }
+
+               this_target.velocity += this_velocity * remaining_mass;
+               this_target.charge   += this.charge * remaining_mass;
+               this_target.mass     += remaining_mass;
+          }
         }
       });
     }
 
     fn update_tree(&mut self) {
-      let matrix = &self.matrix;
+      let matrix = self.matrix.source();
       let dim    = self.dim;
       let leaf = |x: &Node| {
         let cell = dim.to(x.center.0 as usize, x.center.1 as usize)
@@ -447,8 +487,8 @@ mod quadtree {
 
   impl<T> Tree<T> {
     pub fn unfold<P,D,C>(parent: P, divide: &D, aggregate: &C) -> Tree<T>
-      where D: Fn(P) -> Either<Children<P>,T>,
-            C: Fn(&T,&T,&T,&T) -> T {
+    where D: Fn(P) -> Either<Children<P>,T>,
+          C: Fn(&T,&T,&T,&T) -> T {
       match divide(parent) {
         Either::Left((a,b,c,d)) => {
           let w = Tree::unfold(a,divide,aggregate);
@@ -466,8 +506,8 @@ mod quadtree {
     }
 
     pub fn fold<A,F,L>(&self, width: usize, acc: A, fold: &F, leaf: &L) -> A
-      where F: Fn(A,&T) -> A,
-            L: Fn(usize,&T) -> bool {
+    where F: Fn(A,&T) -> A,
+          L: Fn(usize,&T) -> bool {
       let value = &self.value;
       if leaf(width,value) {
         fold(acc,value)
@@ -485,8 +525,8 @@ mod quadtree {
     }
 
     pub fn aggregate<I,L>(&mut self, inner: &I, leaf: &L)
-      where I: Fn(&T,&T,&T,&T) -> T,
-            L: Fn(&T) -> T {
+    where I: Fn(&T,&T,&T,&T) -> T,
+          L: Fn(&T) -> T {
       self.value = {
         let value    = &self.value;
         let children = &mut self.children;
@@ -530,11 +570,49 @@ mod hash {
   }
 }
 
+mod dbuffer {
+  pub struct DBuffer<T> {
+    a: T,
+    b: T,
+    source_is_a: bool,
+  }
+
+  impl<T> DBuffer<T> {
+    pub fn new(a: T, b: T) -> DBuffer<T> {
+      DBuffer {
+        a, b, source_is_a: true
+      }
+    }
+
+    pub fn source(&self) -> &T {
+      if self.source_is_a {&self.a} else {&self.b}
+    }
+
+    pub fn target(&mut self) -> &mut T {
+      if self.source_is_a {&mut self.b} else {&mut self.a}
+    }
+
+    pub fn source_target(&mut self) -> (&T, &mut T) {
+      if self.source_is_a {
+        (&self.a, &mut self.b)
+      }
+      else {
+        (&self.b, &mut self.a)
+      }
+    }
+
+    pub fn swap(&mut self) {
+      self.source_is_a = !self.source_is_a;
+    }
+  }
+}
+
 mod vec2 {
   use std::ops::Add;
   use std::ops::Sub;
   use std::ops::Mul;
   use std::ops::Div;
+  use std::ops::AddAssign;
 
   #[derive(Copy,Clone,Debug)]
   pub struct Vec2<T>(pub T, pub T);
@@ -554,14 +632,14 @@ mod vec2 {
   }
 
   impl<T> Add for Vec2<T>
-    where T: Add<Output = T> {
+  where T: Add<Output = T> {
     type Output = Vec2<T>;
     fn add(self, other: Vec2<T>) -> Vec2<T> {
       Vec2(self.0 + other.0, self.1 + other.1)
     }
   }
   impl<T> Add<T> for Vec2<T>
-    where T: Add<Output = T> + Copy {
+  where T: Add<Output = T> + Copy {
     type Output = Vec2<T>;
     fn add(self, other: T) -> Vec2<T> {
       Vec2(self.0 + other, self.1 + other)
@@ -569,14 +647,14 @@ mod vec2 {
   }
 
   impl<T> Sub for Vec2<T>
-    where T: Sub<Output = T> {
+  where T: Sub<Output = T> {
     type Output = Vec2<T>;
     fn sub(self, other: Vec2<T>) -> Vec2<T> {
       Vec2(self.0 - other.0, self.1 - other.1)
     }
   }
   impl<T> Sub<T> for Vec2<T>
-    where T: Sub<Output = T> + Copy {
+  where T: Sub<Output = T> + Copy {
     type Output = Vec2<T>;
     fn sub(self, other: T) -> Vec2<T> {
       Vec2(self.0 - other, self.1 - other)
@@ -584,14 +662,14 @@ mod vec2 {
   }
 
   impl<T> Mul for Vec2<T>
-    where T: Mul<Output = T> {
+  where T: Mul<Output = T> {
     type Output = Vec2<T>;
     fn mul(self, other: Vec2<T>) -> Vec2<T> {
       Vec2(self.0 * other.0, self.1 * other.1)
     }
   }
   impl<T> Mul<T> for Vec2<T>
-    where T: Mul<Output = T> + Copy {
+  where T: Mul<Output = T> + Copy {
     type Output = Vec2<T>;
     fn mul(self, other: T) -> Vec2<T> {
       Vec2(self.0 * other, self.1 * other)
@@ -599,17 +677,25 @@ mod vec2 {
   }
 
   impl<T> Div for Vec2<T>
-    where T: Div<Output = T> {
+  where T: Div<Output = T> {
     type Output = Vec2<T>;
     fn div(self, other: Vec2<T>) -> Vec2<T> {
       Vec2(self.0 / other.0, self.1 / other.1)
     }
   }
   impl<T> Div<T> for Vec2<T>
-    where T: Div<Output = T> + Copy {
+  where T: Div<Output = T> + Copy {
     type Output = Vec2<T>;
     fn div(self, other: T) -> Vec2<T> {
       Vec2(self.0 / other, self.1 / other)
+    }
+  }
+
+  impl<T> AddAssign for Vec2<T>
+  where T: AddAssign {
+    fn add_assign(&mut self, other: Vec2<T>) {
+      self.0 += other.0;
+      self.1 += other.1;
     }
   }
 }
